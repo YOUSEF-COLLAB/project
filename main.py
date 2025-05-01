@@ -1,25 +1,82 @@
+
 import os
 import uvicorn
 import firebase_admin
 from firebase_admin import credentials, firestore
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Depends, HTTPException
 from dotenv import load_dotenv
-from apiiiii.model import predict_label
+from pydantic import BaseModel
+from models.model import predict_label  # Assuming this is your ML model for behavior prediction
 
 # ✅ Load environment variables
 load_dotenv()
 
-# ✅ Firebase Setup
-cred = credentials.Certificate("secrets/firebase-key.json")
-  # Make sure this is in .gitignore
-firebase_admin.initialize_app(cred)
-db = firestore.client()
-
 # ✅ FastAPI App
 app = FastAPI()
+from fastapi.middleware.cors import CORSMiddleware
 
-# ✅ Sensor Model
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, set this to your actual frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ✅ Firebase setup
+cred = credentials.Certificate("firebase-key.json")  # Make sure this file is in your project root
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+class User(BaseModel):
+    email: str
+    password: str
+
+# ✅ Signup Route
+@app.post("/signup")
+async def signup(user: User):
+    # Check if user already exists
+    existing_user = db.collection("users").where("email", "==", user.email).stream()
+    if list(existing_user):
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    # Save the new user to Firebase
+    db.collection("users").add(user.dict())
+    return {"message": "Signup successful!"}
+
+# ✅ Login Route
+@app.post("/login")
+async def login(user: User):
+    # Check if user exists
+    existing_user = db.collection("users").where("email", "==", user.email).stream()
+    user_data = list(existing_user)
+
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Check password (this should be hashed in production)
+    stored_user = user_data[0].to_dict()
+    if stored_user["password"] != user.password:
+        raise HTTPException(status_code=400, detail="Incorrect password")
+
+    return {"message": "Login successful!"}
+
+# ✅ Vehicle Data Storage (Temporary)
+vehicle_data = {}
+
+# ✅ API to Add Driver Data
+class Driver(BaseModel):
+    name: str
+    car_type: str
+    speed: int
+    rpm: int
+
+@app.post("/add_driver")
+def add_driver(driver: Driver):
+    db.collection("drivers").add(driver.dict())
+    return {"message": "Driver data saved to Firebase!"}
+
+# ✅ Behavior Prediction Model
 class SensorData(BaseModel):
     AccX: float
     AccY: float
@@ -28,7 +85,6 @@ class SensorData(BaseModel):
     GyroY: float
     GyroZ: float
 
-# ✅ Predict Driving Behavior from Sensor Data
 @app.post("/predict_behavior")
 def get_behavior_prediction(sensor: SensorData):
     input_data = [sensor.AccX, sensor.AccY, sensor.AccZ, sensor.GyroX, sensor.GyroY, sensor.GyroZ]
@@ -36,21 +92,6 @@ def get_behavior_prediction(sensor: SensorData):
     if label is None:
         return {"message": "⏳ Waiting for more sensor data to build rolling features."}
     return {"predicted_behavior": label}
-
-# ✅ Vehicle Data Storage (Temporary)
-vehicle_data = {}
-
-# ✅ Add Driver to Firestore
-@app.post("/add_driver")
-def add_driver(name: str, car_type: str, speed: int, rpm: int):
-    driver_data = {
-        "name": name,
-        "car_type": car_type,
-        "speed": speed,
-        "rpm": rpm
-    }
-    db.collection("drivers").add(driver_data)
-    return {"message": "Driver data saved to Firestore successfully!"}
 
 # ✅ Welcome Message
 @app.get("/")
@@ -69,7 +110,8 @@ car_fuel_data = {
 def fuel_usage(car_type: str, speed: float, hours: float):
     fuel_rate = car_fuel_data.get(car_type.lower())
     if fuel_rate is None:
-        return {"error": "Car type not found"}
+        raise HTTPException(status_code=400, detail="Car type not found")
+    
     fuel_used = (fuel_rate * hours) if speed > 0 else 0
     return {
         "car_type": car_type,
@@ -79,17 +121,19 @@ def fuel_usage(car_type: str, speed: float, hours: float):
     }
 
 # ✅ Speed & RPM Tracking
-IDEAL_SPEED = 80
+IDEAL_SPEED = 80  # km/h
 IDEAL_RPM = 90
 
 @app.get("/vehicle")
 def track_vehicle(speed: int, rpm: int):
     status = "Running" if speed > 0 else "Stopped"
     warnings = []
+    
     if speed > IDEAL_SPEED:
         warnings.append("⚠️ Speed limit exceeded!")
     if rpm > IDEAL_RPM:
         warnings.append("⚠️ RPM limit exceeded!")
+    
     return {
         "speed": speed,
         "rpm": rpm,
@@ -132,26 +176,31 @@ def auto_park(latitude: float, longitude: float, speed: float):
 # ✅ Driver Scoring System
 @app.get("/driver-score")
 def driver_score(speed: float, rpm: float):
-    score = 100
+    score = 100  # Start with a perfect score
+
     if rpm < 60:
         score -= 10
     elif rpm > 100:
         score -= 20
+
     if speed < 50:
         score -= 5
     elif speed > 80 and speed <= 120:
         score -= 15
     elif speed > 120:
         score -= 30
-    score = max(0, score)
+
+    score = max(0, score)  # Prevent negative scores
+
     if score >= 85:
-        rating = "Excellent 🚗🚨"
+        rating = "Excellent 🚗💨"
     elif score >= 65:
         rating = "Good 👍"
     elif score >= 40:
         rating = "Needs Improvement ⚠️"
     else:
         rating = "Dangerous Driving! ❌"
+
     return {
         "speed": speed,
         "rpm": rpm,
@@ -159,7 +208,7 @@ def driver_score(speed: float, rpm: float):
         "rating": rating
     }
 
-# ✅ Ensure Firebase Port Usage
+# ✅ Ensure Cloud Run Uses the Correct Port
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8080))  # ✅ Cloud Run expects this
     uvicorn.run(app, host="0.0.0.0", port=port)
